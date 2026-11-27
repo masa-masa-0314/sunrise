@@ -1240,7 +1240,8 @@ impl RealmsClient {
         if status == 503 || status == 277 {
             let pause = response
                 .header("Retry-After")
-                .and_then(|s| s.trim().parse().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|seconds| *seconds <= 120)
                 .unwrap_or(5);
             return Err(RealmsError::Retry(pause));
         }

@@ -423,6 +423,7 @@ pub struct Title {
     open_request: Option<String>,
     /// A Realm's checked address, once the Realms screen's join came back.
     connect_request: Option<String>,
+    realms_notifications: crate::realms::NotificationBadges,
     /// EditWorldScreen's and WorldOpenFlows' `SystemToast` and its slide.
     pending_toast: Option<WorldToast>,
     icons: RefCell<std::collections::HashMap<PathBuf, (std::time::SystemTime, Option<Vec<u8>>)>>,
@@ -704,6 +705,21 @@ impl Title {
     pub fn mode_activation(&self) -> u64 {
         self.mode_activation
     }
+
+    pub fn tick_realms_notifications(&mut self, enabled: bool) {
+        if matches!(self.mode, Mode::Main) {
+            let persistence = self
+                .saves
+                .parent()
+                .map(|dir| dir.join("realms_persistence.json"));
+            self.realms_notifications
+                .tick(enabled, persistence.as_deref());
+        }
+    }
+
+    pub(crate) fn realms_notifications(&self) -> &crate::realms::NotificationBadges {
+        &self.realms_notifications
+    }
     /// The screen `set_mode` left for the game to announce and apply.
     pub fn take_requested(&mut self) -> Option<Mode> {
         self.requested.take()
@@ -818,6 +834,7 @@ impl Title {
             erase_check: Cell::new([0.0; 4]),
             open_request: None,
             connect_request: None,
+            realms_notifications: crate::realms::NotificationBadges::new(),
             pending_toast: None,
             icons: RefCell::new(std::collections::HashMap::new()),
             splash: choose_splash(splashes, splash_index, (today.month(), today.day())),

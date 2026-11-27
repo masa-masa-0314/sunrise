@@ -1,4 +1,5 @@
 // Included in realms.rs to retain its private scope.
+const REGION_LIST_TOP: f32 = 33.0 + 30.0;
 impl Screen {
     pub fn new() -> Self {
         Self::with_saves(None)
@@ -17,6 +18,8 @@ impl Screen {
             state: FetchState::Unauthenticated,
             subscreen: SubScreen::Main,
             selected: None,
+            selected_realm_id: None,
+            selected_notice: None,
             joining: None,
             leaving: None,
             last_click: None,
@@ -140,6 +143,9 @@ impl Screen {
         if !matches!(self.subscreen, SubScreen::Main) {
             return None;
         }
+        if let Some((_, message)) = &self.selected_notice {
+            return Some(message.clone());
+        }
         let server = self.selected_server()?;
         if server.state == "UNINITIALIZED" {
             return Some(crate::screen_narrator::translate(
@@ -228,6 +234,11 @@ impl Screen {
             .find(|notification| notification.kind == "visitUrl" && notification.url.is_some())
     }
 
+    fn notice_identity(&self) -> Option<(String, String)> {
+        self.notice()
+            .map(|notice| (notice.uuid.clone(), notice.visit_message()))
+    }
+
     /// `NotificationMessageEntry.textWidth`: the row is 300 wide, 40 a side.
     fn notice_lines(&self, atlas: &HudAtlas) -> Vec<String> {
         match self.notice() {
@@ -266,6 +277,13 @@ impl Screen {
         }
         let uuid = notification.uuid.clone();
         self.notifications.retain(|n| n.uuid != uuid);
+        if self
+            .selected_notice
+            .as_ref()
+            .is_some_and(|(id, _)| *id == uuid)
+        {
+            self.selected_notice = None;
+        }
         if let Some(client) = client() {
             let uuids = vec![uuid];
             self.dismiss_job = Some(spawn(move || client.notifications_dismiss(&uuids)));
@@ -326,8 +344,14 @@ impl Screen {
     }
 
     /// `RealmsMainScreen.refreshServerList`.
+    fn remember_realm_selection(&mut self) {
+        if matches!(self.state, FetchState::Loaded(_)) {
+            self.selected_realm_id = self.selected_server().map(|server| server.id);
+        }
+    }
+
     pub fn refresh(&mut self) {
-        self.selected = None;
+        self.remember_realm_selection();
         let now = Instant::now();
         self.last_list_refresh = now;
         self.last_pending_refresh = now;
@@ -379,6 +403,14 @@ impl Screen {
         };
     }
 
+    fn show_pack_error(&mut self, parent: Box<SubScreen>) {
+        self.subscreen = SubScreen::Error {
+            title: crate::lang::get("mco.errorMessage.generic"),
+            detail: crate::lang::get("mco.download.resourcePack.fail"),
+            next: parent,
+        };
+    }
+
     /// `RealmsMainScreen.openRealmsPdp`: the product page, and its `trialAvailable` check.
     fn open_pdp(&mut self) {
         let trial_job = client().map(|client| spawn(move || client.trial_available()));
@@ -393,6 +425,27 @@ impl Screen {
 
     /// Picks up what the workers finished; called once a frame.
     pub fn poll(&mut self) -> Outcome {
+        if let SubScreen::DownloadingPack { job, parent } = &self.subscreen {
+            let Some(result) = take(job) else {
+                return Outcome::None;
+            };
+            let parent = parent.clone();
+            match result {
+                Ok(staged) => {
+                    let address = staged.address.clone();
+                    *pack::PENDING_PACK
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(staged);
+                    self.subscreen = *parent;
+                    return Outcome::Connect(address);
+                }
+                Err(error) => {
+                    log::warn!("Couldn't download Realms resource pack: {error}");
+                    self.show_pack_error(parent);
+                    return Outcome::None;
+                }
+            }
+        }
         // The upload screens' workers first: the state match below covers the rest.
         if let Some(outcome) = self.poll_upload_screens() {
             return outcome;
@@ -404,6 +457,7 @@ impl Screen {
             if !matches!(self.state, FetchState::Loading(_))
                 && now.duration_since(self.last_list_refresh) >= Duration::from_secs(60)
             {
+                self.selected_realm_id = self.selected_server().map(|server| server.id);
                 self.last_list_refresh = now;
                 self.state = match client() {
                     Some(client) => FetchState::Loading(spawn(move || client.list_worlds())),
@@ -438,6 +492,11 @@ impl Screen {
                 Ok(mut servers) => {
                     let owner = session().map(|s| s.name.clone());
                     sort_servers(&mut servers, owner.as_deref());
+                    self.selected = self
+                        .selected_realm_id
+                        .take()
+                        .and_then(|id| servers.iter().position(|server| server.id == id));
+                    self.last_click = None;
                     if self.redirect_to_pdp {
                         self.redirect_to_pdp = false;
                         open_pdp_if_no_realms =
@@ -497,6 +556,9 @@ impl Screen {
             self.notifications_job = None;
             if let Ok(notifications) = result {
                 self.notifications = notifications;
+                if !notice_identity_matches(self.selected_notice.as_ref(), self.notice()) {
+                    self.selected_notice = None;
+                }
                 self.mark_notifications_seen();
                 self.show_info_popup();
             }
@@ -525,6 +587,7 @@ impl Screen {
         let mut created = false;
         // The settings save finished: a Play or the close toggle continues.
         let mut settings_saved = false;
+        let mut settings_error = None;
         // An invite-code fetch failure: `RealmsGenericErrorScreen` over the players tab.
         let mut codes_error: Option<(RealmServer, RealmsError)> = None;
         // `RestoreTask`'s failure: the error screen over the configuration screen.
@@ -568,11 +631,60 @@ impl Screen {
                     }
                 }
             }
-            SubScreen::PendingInvites { invites, job, .. } => {
+            SubScreen::PendingInvites {
+                invites,
+                job,
+                actions,
+                selected,
+                ..
+            } => {
                 if let Some(result) = job.as_ref().and_then(take) {
                     *job = None;
-                    *invites = Some(result);
+                    *invites = Some(Ok(result.unwrap_or_else(|error| {
+                        log::warn!("Couldn't list Realms invites: {}", error.text());
+                        Vec::new()
+                    })));
                 }
+                actions.retain(|action| {
+                    let Some((id, accept, result)) = take(action) else {
+                        return true;
+                    };
+                    match result {
+                        Ok(()) => {
+                            if let Some(Ok(list)) = invites
+                                && let Some(row) =
+                                    list.iter().position(|invite| invite.invitation_id == id)
+                            {
+                                list.remove(row);
+                                *selected = selected.and_then(|index| {
+                                    if index == row {
+                                        None
+                                    } else {
+                                        Some(if index > row { index - 1 } else { index })
+                                    }
+                                });
+                            }
+                            if accept && let Some(client) = client() {
+                                if matches!(self.state, FetchState::Loaded(_)) {
+                                    self.selected_realm_id = match (&self.state, self.selected) {
+                                        (FetchState::Loaded(servers), Some(index)) => {
+                                            servers.get(index).map(|realm| realm.id)
+                                        }
+                                        _ => None,
+                                    };
+                                }
+                                self.last_list_refresh = Instant::now();
+                                self.state =
+                                    FetchState::Loading(spawn(move || client.list_worlds()));
+                            }
+                            self.last_pending_refresh = Instant::now();
+                            self.pending_invites_job =
+                                client().map(|client| spawn(move || client.pending_invites()));
+                        }
+                        Err(error) => log::warn!("Couldn't handle Realms invite: {}", error.text()),
+                    }
+                    false
+                });
             }
             SubScreen::Configure {
                 server,
@@ -693,30 +805,33 @@ impl Screen {
                 if let Some(result) = saving.as_ref().and_then(take) {
                     *saving = None;
                     match result {
-                        // `saveSettings` updates the screen's own copy and reads again; the
-                        // saved distances are the tier's new current ones.
-                        Ok(()) => {
-                            if let Some(draft) = settings.as_ref() {
-                                server.name = draft.name.trim().to_owned();
-                                server.motd = draft.description.clone();
-                                server.region_selection_preference = Some(draft.preference_dto());
-                                if let Some(Ok(config)) = tier.as_mut() {
-                                    let update = |range: &mut Option<RealmTierRange>,
-                                                  picked: Option<i32>| {
-                                        if let (Some(range), Some(picked)) =
-                                            (range.as_mut(), picked)
-                                        {
-                                            range.current = Some(picked);
-                                        }
-                                    };
-                                    update(&mut config.render_distance, draft.render_distance);
-                                    update(&mut config.sim_distance, draft.simulation_distance);
-                                }
+                        // Commit the values captured when the request started.
+                        Ok(draft) => {
+                            server.name = draft.name.clone();
+                            server.motd = draft.description.clone();
+                            server.region_selection_preference = Some(draft.preference_dto());
+                            if let Some(Ok(config)) = tier.as_mut() {
+                                let update = |range: &mut Option<RealmTierRange>, picked| {
+                                    if let (Some(range), Some(picked)) = (range.as_mut(), picked) {
+                                        range.current = Some(picked);
+                                    }
+                                };
+                                update(&mut config.render_distance, draft.render_distance);
+                                update(&mut config.sim_distance, draft.simulation_distance);
                             }
-                            refetch_detail = true;
+                            if let Some(Ok(detail)) = detail {
+                                detail.name.clone_from(&server.name);
+                                detail.motd.clone_from(&server.motd);
+                                detail
+                                    .region_selection_preference
+                                    .clone_from(&server.region_selection_preference);
+                            }
                             settings_saved = true;
                         }
-                        Err(e) => *error = Some(e.text()),
+                        Err(e) => {
+                            self.after_save = None;
+                            settings_error = Some(e);
+                        }
                     }
                 }
                 if let Some(result) = deleting.as_ref().and_then(take) {
@@ -852,6 +967,10 @@ impl Screen {
                         Ok(list) => *codes = Some(Ok(list)),
                         // `handleFailure`: the failure replaced the screen with the generic
                         // error screen, whose next screen is the configuration screen.
+                        Err(e) if codes.is_some() => {
+                            codes_action_error =
+                                Some((server.clone(), codes.clone(), *selected, e));
+                        }
                         Err(e) => codes_error = Some((server.clone(), e)),
                     }
                 }
@@ -1100,8 +1219,17 @@ impl Screen {
                 }),
             };
         }
+        if let Some(error) = settings_error {
+            let code = error.code();
+            self.subscreen = SubScreen::Error {
+                title: crate::lang::tr("mco.errorMessage.realmsService.realmsError", &[&code]),
+                detail: error.message(),
+                next: Box::new(self.subscreen.clone()),
+            };
+            return Outcome::None;
+        }
         if settings_saved && let Some(action) = self.after_save.take() {
-            let _ = self.run_after_save(action);
+            return self.run_after_save(action);
         }
         if refetch_codes {
             self.start_invite_codes();
@@ -1195,11 +1323,6 @@ impl Screen {
             return Outcome::None;
         };
         match (address.resource_pack_url, address.resource_pack_hash) {
-            // `new URL(..)` fails in scheduleResourcePackDownload: the pack can't download.
-            (Some(url), Some(_)) if !crate::server_packs::valid_url(&url) => {
-                self.show_generic_error(crate::lang::get("mco.download.resourcePack.fail"));
-                Outcome::None
-            }
             (Some(url), Some(hash)) => {
                 let pack = RealmsPack {
                     address: target,
@@ -1207,7 +1330,7 @@ impl Screen {
                     url,
                     hash,
                 };
-                self.subscreen = SubScreen::Popup(Popup::ResourcePack { pack });
+                self.subscreen = SubScreen::Popup(Popup::ResourcePack { pack, parent: last });
                 Outcome::None
             }
             _ => {
@@ -1251,7 +1374,20 @@ impl Screen {
         }
     }
 
+    fn settings_saving(&self) -> bool {
+        matches!(
+            self.subscreen,
+            SubScreen::Configure {
+                saving: Some(_),
+                ..
+            }
+        )
+    }
+
     pub(crate) fn focused_box(&self, (w, h): (f32, f32)) -> Option<[f32; 4]> {
+        if self.settings_saving() {
+            return None;
+        }
         match &self.subscreen {
             SubScreen::JoinCode { .. } => {
                 // The field sits at the draw's content y + 13 (`AbstractRealmsCodeScreen`'s
@@ -1310,6 +1446,9 @@ impl Screen {
     pub(crate) fn focused_text(
         &mut self,
     ) -> Option<(crate::clipboard::FieldId, &mut String, usize)> {
+        if self.settings_saving() {
+            return None;
+        }
         match &mut self.subscreen {
             // `RealmsJoinRealmWithCodeScreen`: `setEditable(false)` while validating.
             SubScreen::JoinCode { code, job, .. } => {
@@ -1357,6 +1496,9 @@ impl Screen {
         ctrl: bool,
         shift: bool,
     ) -> Option<bool> {
+        if self.settings_saving() {
+            return Some(false);
+        }
         use winit::keyboard::KeyCode;
         if !ctrl {
             return None;
@@ -1401,17 +1543,23 @@ impl Screen {
         // `Mth.clamp(tabIndex, 0, this.tabs.size() - 1)`.
         let index = next?.min(ConfigureTab::ALL.len() - 1);
         let wanted = ConfigureTab::ALL[index];
-        let expired = match &self.subscreen {
-            SubScreen::Configure { server, .. } => server.expired,
-            _ => false,
-        };
-        if !wanted.enabled(expired) || wanted == current {
-            return Some(false);
+        Some(self.change_configure_tab(wanted))
+    }
+
+    fn change_configure_tab(&mut self, wanted: ConfigureTab) -> bool {
+        if !matches!(&self.subscreen, SubScreen::Configure { tab, server, .. }
+            if *tab != wanted && wanted.enabled(server.expired))
+        {
+            return false;
         }
-        // `onTabDeselected` saves an active settings tab before the new one opens.
-        if current == ConfigureTab::Settings {
-            self.save_settings_tab();
+        if self.save_settings_tab() {
+            self.after_save = Some(AfterSave::Tab(wanted));
+            return false;
         }
+        self.select_configure_tab(wanted)
+    }
+
+    fn select_configure_tab(&mut self, wanted: ConfigureTab) -> bool {
         if let SubScreen::Configure {
             server,
             tab,
@@ -1438,14 +1586,18 @@ impl Screen {
                 *settings = Some(draft);
             }
             *tab = wanted;
-            return Some(true);
+            self.invalidate_players_frame();
+            return true;
         }
-        Some(false)
+        false
     }
 
     /// `AbstractSliderButton.onDrag`: the settings tab's held distance slider follows the
     /// pointer while the button stays down.
     pub fn drag(&mut self, cursor: (f32, f32), (w, h): (f32, f32)) -> bool {
+        if self.settings_saving() {
+            return false;
+        }
         if self.drag_players(cursor.1, (w, h)) {
             return true;
         }
@@ -1548,6 +1700,19 @@ impl Screen {
     /// the title (true). The reset screens keep vanilla's parents: the configuration screen
     /// for the reset screen, the reset screen for the two lists.
     pub fn escape(&mut self) -> bool {
+        if matches!(self.subscreen, SubScreen::DownloadingPack { .. }) {
+            return false;
+        }
+        if let SubScreen::Popup(Popup::ResourcePack { parent, .. }) = &self.subscreen {
+            self.subscreen = *parent.clone();
+            return false;
+        }
+        if self.settings_saving() {
+            return false;
+        }
+        if matches!(self.subscreen, SubScreen::InviteCodes { job: Some(_), .. }) {
+            return false;
+        }
         if self.restore_removal_parent() {
             return false;
         }
@@ -1779,15 +1944,14 @@ impl Screen {
     }
 
     fn back_to_list(&mut self) {
-        self.save_settings_tab();
+        if self.save_settings_tab() {
+            self.after_save = Some(AfterSave::Back);
+            return;
+        }
         if let Some((_, aborted)) = self.joining.take() {
             aborted.store(true, Ordering::Relaxed);
         }
-        let reload = matches!(self.subscreen, SubScreen::PendingInvites { .. });
         self.subscreen = SubScreen::Main;
-        if reload {
-            self.refresh();
-        }
     }
 
     /// Play: `RealmsMainScreen.play` → `GetServerDetailsTask` on a worker. The screen
@@ -2001,13 +2165,20 @@ impl Screen {
         if saving.is_some() {
             return false;
         }
-        let wanted = draft.preference_dto();
+        let mut submitted = draft.clone();
+        if submitted.name.trim().is_empty() {
+            submitted.name.clear();
+        }
+        if submitted.description.trim().is_empty() {
+            submitted.description.clear();
+        }
+        let wanted = submitted.preference_dto();
         let region_changed = server.region_selection_preference.as_ref().map_or(
             wanted.region_selection_preference != client::AUTOMATIC_OWNER,
             |p| *p != wanted,
         );
         let configuration_changed =
-            draft.name.trim() != server.name || draft.description != server.motd || region_changed;
+            submitted.name != server.name || submitted.description != server.motd || region_changed;
         let (render_distance, sim_distance) = match tier.as_ref() {
             Some(Ok(config)) => (
                 changed_distance(draft.render_distance, config.render_distance.as_ref()),
@@ -2027,14 +2198,16 @@ impl Screen {
         let Some(client) = client() else {
             return false;
         };
-        let (id, name, description) = (
-            server.id,
-            draft.name.trim().to_owned(),
-            draft.description.clone(),
-        );
+        let id = server.id;
         *saving = Some(spawn(move || {
             if configuration_changed {
-                client.update_configuration(id, &name, &description, &wanted, &slot)?;
+                client.update_configuration(
+                    id,
+                    &submitted.name,
+                    &submitted.description,
+                    &wanted,
+                    &slot,
+                )?;
             }
             if let Some(render_distance) = render_distance {
                 client.update_render_distance(id, render_distance)?;
@@ -2042,7 +2215,9 @@ impl Screen {
             if let Some(simulation_distance) = sim_distance {
                 client.update_simulation_distance(id, simulation_distance)?;
             }
-            Ok(())
+            submitted.render_distance = render_distance;
+            submitted.simulation_distance = sim_distance;
+            Ok(submitted)
         }));
         true
     }
@@ -2062,6 +2237,15 @@ impl Screen {
     /// `openTheWorld` and Play).
     fn run_after_save(&mut self, action: AfterSave) -> Outcome {
         match action {
+            AfterSave::Back => {
+                self.subscreen = SubScreen::Main;
+                self.refresh();
+                Outcome::None
+            }
+            AfterSave::Tab(wanted) => {
+                self.select_configure_tab(wanted);
+                Outcome::None
+            }
             AfterSave::Play(server) => self.start_join(server),
             AfterSave::Close(id) => {
                 if let SubScreen::Configure { error, job, .. } = &mut self.subscreen
@@ -2711,15 +2895,9 @@ impl Screen {
                 let job = {
                     let abort = Arc::clone(&abort);
                     spawn(move || {
-                        for _ in 0..25 {
-                            if abort.load(Ordering::Relaxed) {
-                                return Ok(());
-                            }
-                            if client.put_into_minigame_mode(realm_id, &minigame)? {
-                                break;
-                            }
-                        }
-                        Ok(())
+                        retry_switch(Some(&abort), || {
+                            client.put_into_minigame_mode(realm_id, &minigame)
+                        })
                     })
                 };
                 RunningTask { job, title, abort }
@@ -2753,7 +2931,7 @@ impl Screen {
                     if slot != active {
                         *title.lock().expect("a task title") =
                             t("mco.minigame.world.slot.screen.title");
-                        client.switch_slot(realm_id, slot)?;
+                        switch_slot_retry(&client, realm_id, slot, Some(&abort))?;
                         if abort.load(Ordering::Relaxed) {
                             return Ok(());
                         }
@@ -2852,6 +3030,20 @@ impl Screen {
 
     pub fn click(&mut self, hit: Option<u8>, x: f32, y: f32, (w, h): (f32, f32)) -> Outcome {
         self.list_clicked = false;
+        if self.settings_saving() || matches!(self.subscreen, SubScreen::DownloadingPack { .. }) {
+            return Outcome::None;
+        }
+        if matches!(self.subscreen, SubScreen::InviteCodes { job: Some(_), .. })
+            || matches!(
+                self.subscreen,
+                SubScreen::InviteCodes {
+                    list_job: Some(_),
+                    ..
+                }
+            ) && hit != Some(161)
+        {
+            return Outcome::None;
+        }
         if hit.is_none()
             && let Some((outcome, list_clicked)) = self.press_players((x, y), (w, h))
         {
@@ -2920,10 +3112,14 @@ impl Screen {
                 Outcome::None
             }
             Some(15) => {
+                self.selected_realm_id = self.selected_server().map(|server| server.id);
+                self.pending_invites_job = client().map(|c| spawn(move || c.pending_invites()));
+                self.last_pending_refresh = Instant::now();
                 let job = client().map(|c| spawn(move || c.pending_invites()));
                 self.subscreen = SubScreen::PendingInvites {
                     invites: None,
                     job,
+                    actions: Vec::new(),
                     scroll: crate::ui::Scroll::default(),
                     selected: None,
                 };
@@ -2962,6 +3158,10 @@ impl Screen {
             // configure screen for the questions `RealmsPopups` builds over it, the list
             // for the leave and resource pack questions.
             Some(51) => {
+                if let SubScreen::Popup(Popup::ResourcePack { parent, .. }) = &self.subscreen {
+                    self.subscreen = *parent.clone();
+                    return Outcome::None;
+                }
                 if self.restore_removal_parent() {
                     return Outcome::None;
                 }
@@ -3082,69 +3282,6 @@ impl Screen {
                         restore_job: None,
                         download_task: None,
                         selected: None,
-                        scroll: crate::ui::Scroll::default(),
-                    };
-                }
-                Outcome::None
-            }
-            // RealmsBackupScreen: a row's Changes (210 + 2i) and Restore (211 + 2i).
-            Some(btn @ 210..=249) => {
-                let picked = match &self.subscreen {
-                    SubScreen::Backups {
-                        server,
-                        slot_id,
-                        backups: Some(Ok(list)),
-                        restore_job,
-                        selected,
-                        scroll,
-                        ..
-                    } => {
-                        let row = usize::from((btn - 210) / 2);
-                        let restore = (btn - 210) % 2 == 1;
-                        list.get(row).cloned().map(|backup| {
-                            (
-                                server.clone(),
-                                *slot_id,
-                                backup,
-                                restore && restore_job.is_none(),
-                                list.clone(),
-                                *selected,
-                                *scroll,
-                            )
-                        })
-                    }
-                    _ => None,
-                };
-                let Some((server, slot_id, backup, restore, list, selected, list_scroll)) = picked
-                else {
-                    return Outcome::None;
-                };
-                if restore && !server.expired {
-                    // `restoreClicked`: `RealmsPopups.warningPopupScreen` first.
-                    self.subscreen = SubScreen::Popup(Popup::RestoreBackup {
-                        server,
-                        slot_id,
-                        backup,
-                        list,
-                        selected,
-                    });
-                } else if !restore {
-                    // `Entry.populateChangeList` filled the backup's change list when the
-                    // list was built; the info screen reads that, not the metadata.
-                    let changes = backup_changes(&list);
-                    let row = usize::from((btn - 210) / 2);
-                    let mut backup = backup;
-                    if let Some(changes) = changes.get(row) {
-                        backup.change_list = changes.clone();
-                        backup.uploaded_version = changes.contains_key("uploaded");
-                    }
-                    self.subscreen = SubScreen::BackupInfo {
-                        server,
-                        slot_id,
-                        backup,
-                        list,
-                        selected,
-                        list_scroll,
                         scroll: crate::ui::Scroll::default(),
                     };
                 }
@@ -3444,12 +3581,7 @@ impl Screen {
             // `RealmsSelectFileToUploadScreen`'s Upload and Back.
             hit @ Some(82..=85 | 93) => self.click_upload_screen(hit),
             Some(sel @ 60..=63) => {
-                if let SubScreen::Configure { server, tab, .. } = &mut self.subscreen
-                    && let Some(wanted) = ConfigureTab::ALL.get(usize::from(sel - 60))
-                    && wanted.enabled(server.expired)
-                {
-                    *tab = *wanted;
-                }
+                self.change_configure_tab(ConfigureTab::ALL[usize::from(sel - 60)]);
                 Outcome::None
             }
             Some(64) => match &self.subscreen {
@@ -3636,7 +3768,13 @@ impl Screen {
                 Outcome::None
             }
             Some(160) => {
-                if let SubScreen::InviteCodes { server, job, .. } = &mut self.subscreen
+                if let SubScreen::InviteCodes {
+                    server,
+                    codes: Some(Ok(codes)),
+                    job,
+                    ..
+                } = &mut self.subscreen
+                    && codes.len() < 5
                     && job.is_none()
                     && let Some(client) = client()
                 {
@@ -3921,17 +4059,16 @@ impl Screen {
                 match row {
                     Row::Nothing => {}
                     Row::Pending(accept, id) => {
-                        if let SubScreen::PendingInvites { job, .. } = &mut self.subscreen
-                            && job.is_none()
+                        if let SubScreen::PendingInvites { actions, .. } = &mut self.subscreen
                             && let Some(client) = client()
                         {
-                            *job = Some(spawn(move || {
+                            actions.push(spawn(move || {
                                 let done = if accept {
                                     client.accept_invite(&id)
                                 } else {
                                     client.reject_invite(&id)
                                 };
-                                done.and_then(|()| client.pending_invites())
+                                (id, accept, done)
                             }));
                         }
                     }
@@ -3982,45 +4119,9 @@ impl Screen {
                 let (bar_x, tab_w) = tab_geometry(w);
                 if y < TAB_HEIGHT && x >= bar_x {
                     let index = ((x - bar_x) / tab_w).floor() as usize;
-                    let current = match &self.subscreen {
-                        SubScreen::Configure { tab, .. } => Some(*tab),
-                        _ => None,
-                    };
-                    if let (Some(current), Some(wanted)) = (current, ConfigureTab::ALL.get(index))
-                        && *wanted != current
-                        && current == ConfigureTab::Settings
-                    {
-                        self.save_settings_tab();
+                    if let Some(&wanted) = ConfigureTab::ALL.get(index) {
+                        self.change_configure_tab(wanted);
                     }
-                    if let SubScreen::Configure {
-                        server,
-                        tab,
-                        settings,
-                        tier,
-                        ..
-                    } = &mut self.subscreen
-                        && let Some(wanted) = ConfigureTab::ALL.get(index)
-                        && wanted.enabled(server.expired)
-                    {
-                        // `onSelected` → `updateData`: the tab refills its fields from
-                        // the Realm each time it is opened, discarding a stale draft.
-                        if *wanted == ConfigureTab::Settings {
-                            let mut draft = SettingsDraft::of(server);
-                            if let Some(Ok(config)) = tier.as_ref() {
-                                draft.render_distance = config
-                                    .render_distance
-                                    .as_ref()
-                                    .map(RealmTierRange::current_or_default);
-                                draft.simulation_distance = config
-                                    .sim_distance
-                                    .as_ref()
-                                    .map(RealmTierRange::current_or_default);
-                            }
-                            *settings = Some(draft);
-                        }
-                        *tab = *wanted;
-                    }
-                    self.invalidate_players_frame();
                     return Outcome::None;
                 }
                 // RealmsSettingsTab's two fields: the click moves the caret between them.
@@ -4132,13 +4233,16 @@ impl Screen {
                 } = &mut self.subscreen
                 {
                     let rows = region_rows(regions);
-                    // The list is 33..h-33, its first entry at 35.
-                    let top = 35.0;
-                    let row = ((y - top + scroll.amount) / 16.0).floor() as usize;
+                    let top = REGION_LIST_TOP;
+                    let bottom = h - 33.0;
+                    let row = ((y - top - 2.0 + scroll.amount.trunc()) / 16.0).floor();
                     let mut double = false;
                     if y >= top
-                        && let Some(pick) = rows.get(row)
+                        && y < bottom
+                        && row >= 0.0
+                        && let Some(pick) = rows.get(row as usize)
                     {
+                        let row = row as usize;
                         let now = SystemTime::now();
                         double = matches!(self.last_click, Some((last, at)) if last == row
                             && now.duration_since(at).is_ok_and(|d| d.as_millis() < 250));
@@ -4466,12 +4570,23 @@ impl Screen {
                 }
                 Outcome::None
             }
-            Popup::ResourcePack { pack } => {
-                let address = pack.address.clone();
-                if let Ok(mut slot) = pack::PENDING_PACK.lock() {
-                    *slot = Some(pack);
-                }
-                Outcome::Connect(address)
+            Popup::ResourcePack { pack, parent } => {
+                let Some(account) = session() else {
+                    self.show_pack_error(parent);
+                    return Outcome::None;
+                };
+                let root = self.saves.as_deref().and_then(std::path::Path::parent)
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let root = root.to_path_buf();
+                let headers = crate::server_packs::download::headers(&account.name, account.uuid);
+                self.subscreen = SubScreen::DownloadingPack {
+                    parent,
+                    job: spawn(move || {
+                        let directory = pack::download_directory(&root).map_err(|error| error.to_string())?;
+                        pack::download(pack, &directory, &headers)
+                    }),
+                };
+                Outcome::None
             }
             // RealmsWorldsTab.switchToFullSlot, answered: `RealmsClient.switchSlot` on a
             // worker, then the detail reads again.
@@ -4488,7 +4603,7 @@ impl Screen {
                     detail: None,
                     detail_job: None,
                     deleting: None,
-                    switching_slot: Some(spawn(move || client.switch_slot(id, slot).map(drop))),
+                    switching_slot: Some(spawn(move || switch_slot_retry(&client, id, slot, None))),
                     member_job: None,
                     settings: None,
                     players_scroll: crate::ui::Scroll::default(),
@@ -4558,6 +4673,57 @@ impl Screen {
         }
     }
 
+    fn click_backup_action(&mut self, action: BackupRowAction) -> Outcome {
+        let SubScreen::Backups {
+            server,
+            slot_id,
+            backups: Some(Ok(list)),
+            selected,
+            scroll,
+            restore_job: None,
+            download_task: None,
+            ..
+        } = &self.subscreen
+        else {
+            return Outcome::None;
+        };
+        let row = match action {
+            BackupRowAction::Changes(row) | BackupRowAction::Restore(row) => row,
+        };
+        let Some(mut backup) = list.get(row).cloned() else {
+            return Outcome::None;
+        };
+        self.subscreen = match action {
+            BackupRowAction::Restore(_) if !server.expired => {
+                SubScreen::Popup(Popup::RestoreBackup {
+                    server: server.clone(),
+                    slot_id: *slot_id,
+                    backup,
+                    list: list.clone(),
+                    selected: *selected,
+                })
+            }
+            BackupRowAction::Changes(_) => {
+                backup.change_list = backup_changes(list).get(row).cloned().unwrap_or_default();
+                if backup.change_list.is_empty() {
+                    return Outcome::None;
+                }
+                backup.uploaded_version = backup.change_list.contains_key("uploaded");
+                SubScreen::BackupInfo {
+                    server: server.clone(),
+                    slot_id: *slot_id,
+                    backup,
+                    list: list.clone(),
+                    selected: *selected,
+                    list_scroll: *scroll,
+                    scroll: crate::ui::Scroll::default(),
+                }
+            }
+            _ => return Outcome::None,
+        };
+        Outcome::None
+    }
+
     fn click_list(&mut self, x: f32, y: f32, (w, h): (f32, f32)) -> Outcome {
         // `RealmsBackupScreen.Entry`: its Restore and Changes buttons first, then the row
         // itself opens the metadata screen.
@@ -4568,8 +4734,8 @@ impl Screen {
                 .iter()
                 .find(|([bx, by, bw, bh], _)| x >= *bx && x < bx + bw && y >= *by && y < by + bh)
                 .map(|(_, id)| *id);
-            if let Some(id) = id {
-                return self.click(Some(id), x, y, (w, h));
+            if let Some(action) = id.filter(|_| (33.0..h - 33.0).contains(&y)) {
+                return self.click_backup_action(action);
             }
             // The row itself only takes the selection; the Changes button opens the
             // metadata screen (`ContainerObjectSelectionList.mouseClicked`).
@@ -4582,7 +4748,7 @@ impl Screen {
             {
                 let rx = ((w - ROW_WIDTH) / 2.0).floor();
                 if x >= rx && x < rx + ROW_WIDTH && y >= 33.0 && y < h - 33.0 {
-                    let row = ((y - 33.0 - 2.0 + scroll.amount) / ROW_HEIGHT).floor();
+                    let row = ((y - 33.0 - 2.0 + scroll.amount.trunc()) / ROW_HEIGHT).floor();
                     if row >= 0.0 && (row as usize) < list.len() {
                         *selected = Some(row as usize);
                     }
@@ -4603,7 +4769,7 @@ impl Screen {
             let (top, bottom) = (33.0, h - 33.0);
             let rx = ((w - 280.0) / 2.0).floor();
             if x >= rx && x < rx + 280.0 && y >= top && y < bottom {
-                let row = ((y - top - 2.0 + scroll.amount) / ROW_HEIGHT).floor();
+                let row = ((y - top - 2.0 + scroll.amount.trunc()) / ROW_HEIGHT).floor();
                 if row >= 0.0 {
                     let row = row as usize;
                     if row < list.len() {
@@ -4706,7 +4872,7 @@ impl Screen {
                 ..
             } if select.is_none() => {
                 let top = if group.is_none() { 59.0 } else { 33.0 };
-                row_at(x, y, w, top, h - 33.0, TEMPLATE_ROW, scroll.amount)
+                row_at(x, y, w, top, h - 33.0, TEMPLATE_ROW, scroll.amount.trunc())
                     .filter(|row| *row < templates.len())
                     .map(|row| (row, true))
             }
@@ -4756,9 +4922,10 @@ impl Screen {
             // `AbstractSelectionList.setSelected(entry)`: the notice entry takes the
             // selection, so no server is selected and the footer's buttons go grey.
             self.selected = None;
+            self.selected_notice = self.notice_identity();
             return Outcome::None;
         }
-        let row = ((y - top - 2.0 - notice_height - amount) / ROW_HEIGHT).floor();
+        let row = ((y - top - 2.0 - notice_height + amount.trunc()) / ROW_HEIGHT).floor();
         let Some(row) = usize::try_from(row as i64)
             .ok()
             .filter(|row| *row < self.servers().len())
@@ -4784,6 +4951,7 @@ impl Screen {
         let now = SystemTime::now();
         let double = matches!(self.last_click, Some((last, at)) if last == row
             && now.duration_since(at).is_ok_and(|d| d.as_millis() < 250));
+        self.selected_notice = None;
         self.selected = Some(row);
         self.last_click = Some((row, now));
         if double && can_play {
@@ -4821,6 +4989,7 @@ impl Screen {
         if len == 0 {
             return false;
         }
+        self.selected_notice = None;
         self.selected = Some(match self.selected {
             None if up => len - 1,
             None => 0,
@@ -4888,6 +5057,9 @@ impl Screen {
     /// `AbstractScrollArea.mouseScrolled` over the product page's list, the template and
     /// upload lists.
     pub fn wheel(&mut self, delta: f32, cursor: (f32, f32), (w, h): (f32, f32)) -> bool {
+        if self.settings_saving() {
+            return false;
+        }
         if self.wheel_players(delta, cursor, (w, h)) {
             return true;
         }
@@ -4952,7 +5124,7 @@ impl Screen {
                 ROW_HEIGHT,
             )),
             SubScreen::RegionPreference { regions, .. } => Some((
-                33.0,
+                REGION_LIST_TOP,
                 h - 33.0,
                 region_rows(regions).len() as f32 * 16.0,
                 16.0,
@@ -5053,7 +5225,7 @@ impl Screen {
                     let rx = ((w - 280.0) / 2.0).floor();
                     let (top, bottom) = (33.0, h - 33.0);
                     for (i, _) in list.iter().enumerate() {
-                        let row_y = top + 2.0 + i as f32 * ROW_HEIGHT - scroll.amount;
+                        let row_y = top + 2.0 + i as f32 * ROW_HEIGHT - scroll.amount.trunc();
                         if row_y + ROW_HEIGHT <= top || row_y >= bottom {
                             continue;
                         }
@@ -5454,9 +5626,16 @@ impl Screen {
                     160,
                     None,
                 ));
-                // `onClose` only runs while the back button is active; a fetch or a
-                // create/delete turns it off (`setControlsActive(false)`).
-                buttons.push((x + 158.0, h - 28.0, 150.0, t("gui.back"), !busy, 161, None));
+                // `onDelete` and `onCreate` turn Back off until the mutation answers.
+                buttons.push((
+                    x + 158.0,
+                    h - 28.0,
+                    150.0,
+                    t("gui.back"),
+                    job.is_none(),
+                    161,
+                    None,
+                ));
             }
             SubScreen::EditCode { active, job, .. } => {
                 let on_off = if *active {
@@ -6084,7 +6263,7 @@ impl Screen {
                         // `StringWidget.setMaxWidth(maxTextWidth)`: 280 - 32 - 32 - 42.
                         let max_text = 174.0;
                         for (i, invite) in list.iter().enumerate() {
-                            let y = top + 2.0 + i as f32 * ROW_HEIGHT - scroll.amount;
+                            let y = top + 2.0 + i as f32 * ROW_HEIGHT - scroll.amount.trunc();
                             if y + ROW_HEIGHT <= top || y >= bottom {
                                 continue;
                             }
@@ -6270,7 +6449,7 @@ impl Screen {
                         let first = batch.vertices.len();
                         let mut rects = Vec::new();
                         for (i, backup) in list.iter().enumerate() {
-                            let y = top + 2.0 + i as f32 * ROW_HEIGHT - scroll.amount;
+                            let y = top + 2.0 + i as f32 * ROW_HEIGHT - scroll.amount.trunc();
                             if y + ROW_HEIGHT <= top || y >= bottom {
                                 continue;
                             }
@@ -6328,25 +6507,25 @@ impl Screen {
                             // it (`iconXOffset` chains them from contentRight).
                             let mut right = rx + ROW_WIDTH - 2.0;
                             let mut row_rects = Vec::new();
-                            // A row's ids are 210 + 2i and 211 + 2i, so 22 rows fit a u8.
-                            if i <= 22 {
-                                if !server.expired {
-                                    let x = right - restore_w - 8.0;
-                                    row_rects
-                                        .push(([x, y + 8.0, restore_w, 20.0], 211 + 2 * i as u8));
-                                    right = x - 8.0;
-                                }
-                                if !changes[i].is_empty() {
-                                    let x = right - changes_w - 8.0;
-                                    row_rects
-                                        .push(([x, y + 8.0, changes_w, 20.0], 210 + 2 * i as u8));
-                                }
+                            if !server.expired {
+                                let x = right - restore_w - 8.0;
+                                row_rects.push((
+                                    [x, y + 8.0, restore_w, 20.0],
+                                    BackupRowAction::Restore(i),
+                                ));
+                                right = x - 8.0;
                             }
-                            for ([bx, by, bw, _], id) in &row_rects {
-                                let label = if *id % 2 == 0 {
-                                    &changes_label
-                                } else {
-                                    &restore_label
+                            if !changes[i].is_empty() {
+                                let x = right - changes_w - 8.0;
+                                row_rects.push((
+                                    [x, y + 8.0, changes_w, 20.0],
+                                    BackupRowAction::Changes(i),
+                                ));
+                            }
+                            for ([bx, by, bw, _], action) in &row_rects {
+                                let label = match action {
+                                    BackupRowAction::Changes(_) => &changes_label,
+                                    BackupRowAction::Restore(_) => &restore_label,
                                 };
                                 let hovered = crate::ui::hovered(cursor, *bx, *by, *bw, 20.0);
                                 crate::ui::button(
@@ -6517,7 +6696,7 @@ impl Screen {
                 let content = entries.len() as f32 * 36.0;
                 let first = batch.vertices.len();
                 for (i, (key, value)) in entries.iter().enumerate() {
-                    let y = top + 2.0 + i as f32 * 36.0 - scroll.amount;
+                    let y = top + 2.0 + i as f32 * 36.0 - scroll.amount.trunc();
                     if y + 36.0 <= top || y >= bottom {
                         continue;
                     }
@@ -7203,8 +7382,8 @@ impl Screen {
                     12.0,
                     u32::MAX,
                 );
-                // The list fills the contents (33..h-33), its first entry at +2.
-                let top = 33.0;
+                // HeaderAndFooterLayout places contents 30 pixels below the title.
+                let top = REGION_LIST_TOP;
                 let bottom = h - 33.0;
                 crate::ui::list_background(batch, atlas, top, bottom, false);
                 crate::ui::tiled_sized(
@@ -7245,7 +7424,7 @@ impl Screen {
                 // pokes past either separator stays inside (`extractListItems`).
                 let first = batch.vertices.len();
                 for (i, (preference, region)) in rows.iter().enumerate() {
-                    let y = top + 2.0 + i as f32 * 16.0 - scroll.amount;
+                    let y = top + 2.0 + i as f32 * 16.0 - scroll.amount.trunc();
                     if y + 16.0 <= top || y >= bottom {
                         continue;
                     }
@@ -7985,7 +8164,8 @@ impl Screen {
                 // the transparent gradient: the leave and resource-pack questions sit over
                 // the list, the close question over the settings tab with its draft.
                 let underlay = match popup {
-                    Popup::Leave(_) | Popup::ResourcePack { .. } => Some(SubScreen::Main),
+                    Popup::Leave(_) => Some(SubScreen::Main),
+                    Popup::ResourcePack { parent, .. } => Some(*parent.clone()),
                     Popup::CloseWorld {
                         server,
                         settings,
@@ -8183,6 +8363,16 @@ impl Screen {
                     self.popup_buttons
                         .set([[left, by, 104.0, 20.0], [left + 110.0, by, 104.0, 20.0]]);
                 }
+            }
+            SubScreen::DownloadingPack { .. } => {
+                centered(
+                    batch,
+                    atlas,
+                    &t("multiplayer.applyingPack"),
+                    cx,
+                    (h / 2.0).floor(),
+                    u32::MAX,
+                );
             }
             SubScreen::Connecting { .. } => {
                 // `GetServerDetailsTask` runs under `RealmsLongRunningMcoTaskScreen`: the
@@ -8397,7 +8587,7 @@ impl Screen {
                     icons.clear();
                     let first = batch.vertices.len();
                     for (i, template) in templates.iter().enumerate() {
-                        let y = top + 2.0 + i as f32 * TEMPLATE_ROW - scroll.amount;
+                        let y = top + 2.0 + i as f32 * TEMPLATE_ROW - scroll.amount.trunc();
                         if y + TEMPLATE_ROW <= top || y >= bottom {
                             continue;
                         }

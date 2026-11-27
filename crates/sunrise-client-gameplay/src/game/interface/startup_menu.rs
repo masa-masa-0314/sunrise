@@ -1507,6 +1507,7 @@ impl Loading {
                 .draw_contents(&self.settings, batch, &gui.atlas, cursor);
             self.menu.options.draw_overlays(batch, &gui.atlas, cursor);
         } else if let Some(title) = &mut self.menu.title {
+            title.tick_realms_notifications(self.settings.file.bool("realmsNotifications"));
             title.poll_backup();
             if std::mem::take(&mut title.onboarding_finished) {
                 // Options.onboardingAccessibilityFinished.

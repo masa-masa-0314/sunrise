@@ -2326,6 +2326,9 @@ impl crate::game::ClientGame<'_> {
             let mods = self.client.settings.mods.installed.len();
             if let Some(title) = &mut self.client.title.0 {
                 title.mods = mods;
+                title.tick_realms_notifications(
+                    self.client.settings.file.bool("realmsNotifications"),
+                );
             }
             let drawn = self.draw_title_screen_with_pre_hook(&mut batch);
             if drawn && let Some(title) = &self.client.title.0 {
