@@ -16,7 +16,7 @@ fn server(id: i64, owner_uuid: Option<&str>) -> RealmServer {
     }
 }
 
-fn listed(servers: Vec<RealmServer>) -> Screen {
+pub(super) fn listed(servers: Vec<RealmServer>) -> Screen {
     Screen {
         state: FetchState::Loaded(servers),
         subscreen: SubScreen::Main,
@@ -45,7 +45,8 @@ fn listed(servers: Vec<RealmServer>) -> Screen {
         popup_buttons: std::cell::Cell::new([[0.0; 4]; 2]),
         main_scroll: crate::ui::Scroll::default(),
         subscription_buttons: std::cell::Cell::new((0.0, 0.0)),
-        players_button_rects: std::cell::RefCell::new(Vec::new()),
+        players_list: super::PlayersList::default(),
+        players_parent: None,
         backup_row_buttons: std::cell::RefCell::new(Vec::new()),
         settings_scroll: crate::ui::Scroll::default(),
         settings_slider: None,
@@ -391,6 +392,7 @@ fn the_settings_buttons_leave_the_scroll_view() {
         detail: None,
         detail_job: None,
         deleting: None,
+        switching_slot: None,
         member_job: None,
         settings: Some(SettingsDraft::of(&server)),
         players_scroll: crate::ui::Scroll::default(),
@@ -536,7 +538,8 @@ fn inviting_an_empty_or_duplicate_name_asks_nothing() {
         popup_buttons: std::cell::Cell::new([[0.0; 4]; 2]),
         main_scroll: crate::ui::Scroll::default(),
         subscription_buttons: std::cell::Cell::new((0.0, 0.0)),
-        players_button_rects: std::cell::RefCell::new(Vec::new()),
+        players_list: super::PlayersList::default(),
+        players_parent: None,
         backup_row_buttons: std::cell::RefCell::new(Vec::new()),
         settings_scroll: crate::ui::Scroll::default(),
         settings_slider: None,
@@ -1207,4 +1210,149 @@ fn transfer_percent_and_bar_keep_double_precision() {
     assert_eq!(transfer_bar_width(f64::NAN), 0.0);
     assert_eq!(transfer_bar_width(0.0025_f64.next_down()), 0.0);
     assert_eq!(transfer_bar_width(0.0025), 1.0);
+}
+
+pub(super) fn loaded_players(count: u128) -> Screen {
+    let mut realm = server(7, None);
+    realm.players = (1..=count)
+        .map(|id| PlayerInfo {
+            name: format!("Player{id:03}"),
+            uuid: Some(format!("{id:032x}")),
+            accepted: true,
+            ..Default::default()
+        })
+        .collect();
+    let mut screen = listed(vec![realm.clone()]);
+    screen.subscreen = configure_screen(realm.clone(), ConfigureTab::Players);
+    if let SubScreen::Configure {
+        detail,
+        tier,
+        regions,
+        subscription,
+        players_scroll,
+        ..
+    } = &mut screen.subscreen
+    {
+        *detail = Some(Ok(realm.clone()));
+        *tier = Some(Ok(Default::default()));
+        *regions = Some(Ok(Vec::new()));
+        *subscription = Some(Ok(Default::default()));
+        players_scroll.amount = 18.0;
+    }
+    if let FetchState::Loaded(servers) = &mut screen.state {
+        servers[0].players = realm.players;
+    }
+    screen
+}
+
+fn assert_restored_players(screen: &Screen, count: usize) {
+    assert!(screen.players_ready());
+    assert!(screen.players_parent.is_none());
+    assert!(matches!(&screen.subscreen, SubScreen::Configure {
+        server, detail: Some(Ok(detail)), detail_job: None, players_scroll, ..
+    } if detail.players.len() == count && detail.players == server.players && players_scroll.amount == 18.0));
+}
+
+#[test]
+fn cancelling_player_removal_restores_the_loaded_tab_and_scroll() {
+    for escape in [false, true] {
+        let mut screen = loaded_players(8);
+        screen.click_player_action(PlayerAction::Remove(2));
+        assert!(
+            matches!(&screen.subscreen, SubScreen::Popup(Popup::Uninvite { player, .. }) if player_uuid(player) == Some(2))
+        );
+        if escape {
+            assert!(!screen.escape());
+        } else {
+            screen.click(Some(51), 0.0, 0.0, (800.0, 240.0));
+        }
+        assert_restored_players(&screen, 8);
+    }
+}
+
+#[test]
+fn confirming_player_removal_updates_both_rosters_before_the_worker() {
+    let mut screen = loaded_players(8);
+    screen.click_player_action(PlayerAction::Remove(2));
+    let SubScreen::Popup(Popup::Uninvite { parent, player }) = screen.subscreen.clone() else {
+        panic!("removal confirmation");
+    };
+    assert_eq!(
+        screen.finish_player_removal(*parent, player_uuid(&player)),
+        Some((7, 2))
+    );
+    assert_restored_players(&screen, 7);
+    assert!(
+        matches!(&screen.subscreen, SubScreen::Configure { server, .. }
+        if server.players.iter().all(|p| player_uuid(p) != Some(2)))
+    );
+}
+
+#[test]
+fn invite_failures_keep_the_loaded_players_parent() {
+    let mut screen = loaded_players(8);
+    screen.click(Some(67), 0.0, 0.0, (800.0, 240.0));
+    let SubScreen::Invite { job, .. } = &mut screen.subscreen else {
+        panic!("invite")
+    };
+    *job = Some(Arc::new(Mutex::new(Some(Err(RealmsError::Parse)))));
+    screen.poll();
+    assert!(matches!(
+        &screen.subscreen,
+        SubScreen::Invite { error: Some(_), .. }
+    ));
+    screen.escape();
+    assert_restored_players(&screen, 8);
+
+    let server = match &screen.subscreen {
+        SubScreen::Configure { server, .. } => server.clone(),
+        _ => unreachable!(),
+    };
+    screen.open_players_child(SubScreen::InviteCodes {
+        server,
+        codes: None,
+        list_job: Some(Arc::new(Mutex::new(Some(Err(RealmsError::Parse))))),
+        job: None,
+        error: None,
+        selected: None,
+    });
+    screen.poll();
+    assert!(matches!(screen.subscreen, SubScreen::Error { .. }));
+    screen.click(Some(91), 0.0, 0.0, (800.0, 240.0));
+    assert_restored_players(&screen, 8);
+}
+
+#[test]
+fn ops_and_invite_answers_update_both_copies_without_refetching() {
+    let mut screen = loaded_players(8);
+    let SubScreen::Configure { member_job, .. } = &mut screen.subscreen else {
+        unreachable!()
+    };
+    *member_job = Some(Arc::new(Mutex::new(Some(Ok(client::Ops {
+        ops: vec!["player001".into(), "Player002".into()],
+    })))));
+    screen.poll();
+    assert_restored_players(&screen, 8);
+    let mut invited = match &screen.subscreen {
+        SubScreen::Configure { server, .. } => {
+            assert!(!server.players[0].operator);
+            assert!(server.players[1].operator);
+            server.players.clone()
+        }
+        _ => unreachable!(),
+    };
+    invited.push(PlayerInfo {
+        name: "Player009".into(),
+        ..Default::default()
+    });
+    screen.click(Some(67), 0.0, 0.0, (800.0, 240.0));
+    let SubScreen::Invite { job, .. } = &mut screen.subscreen else {
+        panic!("invite")
+    };
+    *job = Some(Arc::new(Mutex::new(Some(Ok(invited.clone())))));
+    screen.poll();
+    assert_restored_players(&screen, 9);
+    assert!(
+        matches!(&screen.subscreen, SubScreen::Configure { server, .. } if server.players == invited && server.name == "Friends")
+    );
 }

@@ -15,7 +15,12 @@ mod draw_notice;
 mod pack;
 mod page;
 mod picture;
+#[path = "realms/players_list.rs"]
+mod players_list;
 mod preset_world;
+
+pub(crate) use players_list::{PlayerAction, PlayerColumn};
+use players_list::{PlayersList, player_uuid};
 mod settings;
 pub mod upload;
 mod upload_screen;
@@ -239,8 +244,8 @@ pub enum Popup {
     Delete(RealmServer),
     /// `RealmsPlayersTab.PlayerEntry.uninvite`'s confirm (`RealmsConfirmScreen`).
     Uninvite {
-        server: RealmServer,
         player: PlayerInfo,
+        parent: Box<SubScreen>,
     },
     /// `RealmsWorldsTab.switchToFullSlot`'s question, then `RealmsClient.switchSlot`.
     SwitchSlot { server: RealmServer, slot: i32 },
@@ -477,8 +482,10 @@ pub enum SubScreen {
         detail_job: Option<Job<Result<RealmServer, RealmsError>>>,
         /// `RealmsClient.deleteRealm` on a worker, from the subscription tab's question.
         deleting: Option<Job<Result<(), RealmsError>>>,
-        /// `RealmsClient.op`/`deop`/`uninvite` on a worker, from the players tab.
-        member_job: Option<Job<Result<(), RealmsError>>>,
+        /// `RealmsClient.switchSlot` on a worker, from the worlds tab.
+        switching_slot: Option<Job<Result<(), RealmsError>>>,
+        /// `RealmsClient.op`/`deop` on a worker, from the players tab.
+        member_job: Option<Job<Result<client::Ops, RealmsError>>>,
         /// The settings tab's editable fields, once the tab has been opened.
         settings: Option<SettingsDraft>,
         /// The players tab's list scroll (`InvitedObjectSelectionList`).
@@ -734,9 +741,10 @@ pub struct Screen {
     /// The subscription tab's Extend and Delete button tops, as the draw laid the
     /// column out (`RealmsSubscriptionTab`'s centred stack).
     subscription_buttons: std::cell::Cell<(f32, f32)>,
-    /// The players tab's per-row buttons as last drawn: the rect and its id (the op
-    /// toggle's width follows its label, which only the draw measures).
-    players_button_rects: std::cell::RefCell<Vec<([f32; 4], u8)>>,
+    /// The Players tab's rendered controls and keyboard focus.
+    players_list: PlayersList,
+    /// The configuration screen preserved while an invite screen is open.
+    players_parent: Option<Box<SubScreen>>,
     /// `RealmsBackupScreen.Entry`'s Changes/Restore buttons as last drawn.
     backup_row_buttons: std::cell::RefCell<Vec<([f32; 4], u8)>>,
     /// The settings tab's `ScrollableLayout`: the column is taller than the tab area on
